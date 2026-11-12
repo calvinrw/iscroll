@@ -45,6 +45,11 @@
 ;; scrolling is triggered and Emacs will reveal one line’s height each
 ;; time.
 ;;
+;; Line motion (`iscroll-next-line', `iscroll-previous-line') takes a
+;; fast path when no image is in or near the window: it calls the
+;; built-in `line-move' directly, so it's as fast as plain `next-line'
+;; away from images.  See `iscroll--fast-path-p'.
+;;
 ;; Commands provided:
 ;;
 ;; - iscroll-up
@@ -210,10 +215,141 @@ function counts from visual line beginning."
       (vertical-motion 0)
       (- col (current-column)))))
 
+(defvar iscroll--last-move-fast nil
+  "Non-nil if the last line motion took the fast path.")
+
+(defvar-local iscroll--saved-scroll-margin nil
+  "How to restore `scroll-margin' after `iscroll--suspend-scroll-margin'.
+A list holding the previous buffer-local value, or the symbol `global'
+if `scroll-margin' had no buffer-local value.")
+
+(defun iscroll--saved-scroll-margin-value ()
+  "Return the `scroll-margin' that `iscroll--suspend-scroll-margin' saved."
+  (if (consp iscroll--saved-scroll-margin)
+      (car iscroll--saved-scroll-margin)
+    (default-value 'scroll-margin)))
+
+(defun iscroll--maybe-restore-scroll-margin ()
+  "Restore a suspended `scroll-margin' once doing so won't scroll.
+That is, once point is at least that many screen lines from both the
+top and the bottom of the window.  Restoring it earlier would make
+redisplay scroll the text in one jump to re-establish the margin."
+  (when iscroll--saved-scroll-margin
+    (let* ((margin (iscroll--saved-scroll-margin-value))
+           (line (1- (count-screen-lines (window-start) (point) t)))
+           (lines-below (- (window-body-height) line 1)))
+      (when (and (>= line margin) (>= lines-below margin))
+        (iscroll--suspend-scroll-margin nil)))))
+
+(defun iscroll--suspend-scroll-margin (suspend)
+  "Set `scroll-margin' to 0 in this buffer if SUSPEND, else restore it.
+Near images iscroll scrolls the window one line at a time and may leave
+point at the window edge; a non-zero `scroll-margin' makes redisplay
+scroll again to restore the margin, which undoes the smooth scroll and
+moves images in and out of view in one jump.  The margin comes back
+\(see `iscroll--maybe-restore-scroll-margin') once it can do so without
+scrolling."
+  (if suspend
+      (unless iscroll--saved-scroll-margin
+        (setq iscroll--saved-scroll-margin
+              (if (local-variable-p 'scroll-margin)
+                  (list scroll-margin)
+                'global))
+        (setq-local scroll-margin 0))
+    (when iscroll--saved-scroll-margin
+      (if (consp iscroll--saved-scroll-margin)
+          (setq-local scroll-margin (car iscroll--saved-scroll-margin))
+        (kill-local-variable 'scroll-margin))
+      (setq iscroll--saved-scroll-margin nil))))
+
+(defun iscroll--image-display-p (display)
+  "Return non-nil if the `display' property value DISPLAY shows an image."
+  (or (eq (car-safe display) 'image)
+      ;; A list or vector of display specs, e.g. ((slice ...) (image ...)).
+      (and (or (consp display) (vectorp display))
+           (not (keywordp (car-safe display)))
+           (seq-some (lambda (spec) (eq (car-safe spec) 'image)) display))))
+
+(defun iscroll--image-between-p (beg end)
+  "Return non-nil if an image is displayed anywhere between BEG and END.
+Checks overlays and `display' text properties only; does no layout,
+so it is cheap compared with measuring line heights."
+  (or (seq-some (lambda (ov)
+                  (iscroll--image-display-p (overlay-get ov 'display)))
+                (overlays-in beg end))
+      (let ((pos beg)
+            found)
+        (while (and (not found) (< pos end))
+          (setq found (iscroll--image-display-p
+                       (get-text-property pos 'display))
+                pos (next-single-property-change pos 'display nil end)))
+        found)))
+
+(defun iscroll--fast-path-p (arg)
+  "Return non-nil if moving ARG lines can use plain `line-move'.
+That's the case unless the window is scrolled part-way into a line
+\(non-zero vscroll) or an image is displayed in the window or within
+ARG lines past its top or bottom edge, i.e. anywhere this motion could
+scroll into view.  The range is measured from the window edges, not
+from point: with a `scroll-margin', the window scrolls while point is
+still that many lines from the edge."
+  (and (zerop (window-vscroll nil t))
+       (let* ((ws (window-start))
+              (we (or (window-end) (point-max)))
+              (beg (if (< arg 0)
+                       (save-excursion (goto-char ws) (forward-line (1- arg)) (point))
+                     ws))
+              (end (if (> arg 0)
+                       (save-excursion (goto-char we) (forward-line (1+ arg)) (point))
+                     we)))
+         (not (iscroll--image-between-p beg end)))))
+
+(defun iscroll--fast-line-move (arg first-command-p)
+  "Move ARG lines with the built-in `line-move' (no images nearby).
+FIRST-COMMAND-P is non-nil if the previous command wasn't an iscroll
+line motion.  Keeps the goal column in step with the slow path."
+  ;; Continuing from a slow-path step: hand iscroll's goal column to
+  ;; `line-move', which keeps its own in `temporary-goal-column'.
+  (when (and (not first-command-p)
+             (not iscroll--last-move-fast)
+             iscroll--goal-column)
+    (setq temporary-goal-column
+          (cons (float iscroll--goal-column) (window-hscroll))))
+  ;; `line-move' keeps the goal column only after `next-line' or
+  ;; `previous-line' (or the same command), so present iscroll's line
+  ;; commands as such.
+  (let ((last-command (if first-command-p last-command 'next-line)))
+    ;; Like the slow path, report hitting the buffer boundary as a
+    ;; message rather than an error.
+    (condition-case err
+        (line-move arg)
+      ((beginning-of-buffer end-of-buffer)
+       (message "%s" (error-message-string err)))))
+  ;; Hand the goal column back for a following slow-path step.
+  (setq iscroll--goal-column (and (consp temporary-goal-column)
+                                  (round (car temporary-goal-column)))
+        iscroll--last-move-fast t))
+
 (defun iscroll-forward-line (&optional arg)
   "Smooth `forward-line'.
-ARG is the number of lines to move."
+ARG is the number of lines to move.  Uses plain `line-move' when no
+image is nearby (see `iscroll--fast-path-p'), and otherwise scrolls
+smoothly over images."
   (interactive "^p")
+  (let ((arg (or arg 1)))
+    (if (iscroll--fast-path-p arg)
+        (progn
+          (iscroll--fast-line-move
+           arg (not (memq last-command
+                          '(iscroll-next-line iscroll-previous-line))))
+          (iscroll--maybe-restore-scroll-margin))
+      (iscroll--suspend-scroll-margin t)
+      (setq iscroll--last-move-fast nil)
+      (iscroll--slow-forward-line arg))))
+
+(defun iscroll--slow-forward-line (&optional arg)
+  "Move ARG lines, scrolling smoothly over images.
+This is the original `iscroll-forward-line'."
   (let* ((arg (or arg 1))
          (abs-arg (abs arg))
          (step (if (> arg 0) 1 -1))
@@ -300,6 +436,7 @@ ARG is the number of lines to move."
         ;; because that shallows ivy’s binding.
         (local-set-key [remap next-line] #'iscroll-next-line)
         (local-set-key [remap previous-line] #'iscroll-previous-line))
+    (iscroll--suspend-scroll-margin nil)
     (kill-local-variable 'mwheel-scroll-up-function)
     (kill-local-variable 'mwheel-scroll-down-function)
     (local-set-key [remap next-line] nil)
